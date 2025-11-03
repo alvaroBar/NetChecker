@@ -28,6 +28,7 @@ class SwitchTester:
             'identify_cmd': ['show system'],
             'identify_keyword': 'Edge-Core',
             'all_devices': ['show arp'],
+            'ip_interface': ['show ip interface vlan 10'],
             'loopback': ['show loop-detection'],
             'loop_status': [],
             'cpu_util': [],
@@ -43,6 +44,7 @@ class SwitchTester:
         'unknown': {
             'identify_cmd': ['show version'],
             'all_devices': ['show arp'],
+            'ip_interface': [],
             'loopback': [],
             'loop_status': [],
             'cpu_util': [],
@@ -310,7 +312,34 @@ class SwitchTester:
                     ports_with_errors.append(port_name)
 
         if not in_error_section:
+            port_name = None
+            port_errors = 0
+            port_discards = 0
+            for line_log in output.splitlines():
+                if line_log.startswith("Port:"):
+                    if port_name and (port_errors > 0 or port_discards > 0):
+                        ports_with_errors.append(f"{port_name} (Errors: {port_errors}, Discards: {port_discards})")
+                    port_name = line_log.split(':')[-1].strip()
+                    port_errors = 0
+                    port_discards = 0
+                elif "Rx Errors:" in line_log or "Tx Errors:" in line_log:
+                    try:
+                        port_errors += int(line_log.split(':')[-1].strip().replace(',', ''))
+                    except:
+                        pass
+                elif "Rx Discards:" in line_log or "Tx Discards:" in line_log:
+                    try:
+                        port_discards += int(line_log.split(':')[-1].strip().replace(',', ''))
+                    except:
+                        pass
+
+            if port_name and (port_errors > 0 or port_discards > 0):
+                ports_with_errors.append(f"{port_name} (Errors: {port_errors}, Discards: {port_discards})")
+
+            if ports_with_errors:
+                return "ERROS ENCONTRADOS!", list(set(ports_with_errors))
             return "Nenhuma informação de erro de porta encontrada", []
+
         if ports_with_errors:
             return "ERROS ENCONTRADOS!", list(set(ports_with_errors))
         return "Nenhum erro encontrado nas portas", []
@@ -361,13 +390,10 @@ class SwitchTester:
         for line in output.splitlines():
             line_lower = line.lower()
 
-            # Checagem de DHCP
             if 'dhcp' in line_lower and any(keyword in line_lower for keyword in dhcp_error_keywords):
                 dhcp_error_lines.append(line.strip())
 
-            # Checagem de PoE
-            if 'poe' in line_lower and any(keyword in line_lower for keyword in poe_error_keywords):
-                # Evita falsos positivos de "power on"
+            if 'poe' in line_lower and any(re.search(keyword, line_lower) for keyword in poe_error_keywords):
                 if "power supply status of port" in line_lower and "changes from off to on" in line_lower:
                     continue
                 poe_error_lines.append(line.strip())
@@ -385,35 +411,80 @@ class SwitchTester:
 
     def get_network_info(self):
         output, _ = self._execute_command_list('ip_interface')
-        if output is None:
-            return {'total_hosts': None, 'mask': 'Desconhecida'}
-
         ip, mask = None, None
 
-        ip_match = re.search(r'IP-Addr\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', output, re.IGNORECASE)
-        mask_match = re.search(r'Subnet-Mask\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', output, re.IGNORECASE)
+        if output:
+            ip_match = re.search(r'(?:IP-Addr|IP Address)\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', output,
+                                 re.IGNORECASE)
+            mask_match = re.search(r'(?:Subnet-Mask|Subnet Mask)\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', output,
+                                   re.IGNORECASE)
 
-        if ip_match:
-            ip = ip_match.group(1)
-        if mask_match:
-            mask = mask_match.group(1)
+            if ip_match:
+                ip = ip_match.group(1)
+            if mask_match:
+                mask = mask_match.group(1)
+
+            if not ip or not mask:
+                match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
+                                  output)
+                if match:
+                    ip, mask = match.group(1), match.group(2)
 
         if not ip or not mask:
-            # Tenta um padrão secundário (comum em outros CLIs)
-            match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', output)
-            if match:
-                ip, mask = match.group(1), match.group(2)
+            self._log("    - Falha ao extrair máscara da interface. Tentando via logs de inicialização...\n")
+            output_logs, _ = self._execute_command_list('logs', log_output=False)
+
+            if output_logs:
+                log_match = re.search(r'set primary ip\s+([0-9.]+)\s+mask\s+([0-9.]+)', output_logs, re.IGNORECASE)
+                if log_match:
+                    self._log("    - Máscara encontrada no log de inicialização.\n")
+                    ip, mask = log_match.group(1), log_match.group(2)
 
         if not ip or not mask:
+            self._log("    - Não foi possível encontrar a máscara de rede.\n")
             return {'total_hosts': None, 'mask': 'Não encontrado'}
 
         try:
-            # Usa o módulo ipaddress para calcular o tamanho da rede
             net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
-            # -2 para remover o endereço de rede e o de broadcast
-            total_hosts = net.num_addresses - 2
+            total_hosts = net.num_addresses - 2 if net.num_addresses > 2 else net.num_addresses
+            self._log(f"    - Rede: {net.network_address}, Máscara: {mask}, Total de IPs: {total_hosts}\n")
             return {'total_hosts': total_hosts, 'mask': mask}
         except Exception as e:
             self._log(f"  [ERRO] Não foi possível calcular o tamanho da rede com ip={ip}, mask={mask}. Detalhes: {e}\n")
             return {'total_hosts': None, 'mask': mask}
 
+    # --- NOVA FUNÇÃO ---
+    def get_mac_address_count(self):
+        """
+        Conta o número de dispositivos conectados com base na tabela MAC.
+        """
+        # Não loga a saída bruta (log_output=False), apenas o resultado.
+        output, _ = self._execute_command_list('mac_table', log_output=False)
+        if output is None:
+            self._log("    - Não foi possível executar 'show mac address-table' para contar dispositivos.\n")
+            return 0
+
+        # Tenta o método mais confiável (parsear o total do TPLINK, como visto no seu log)
+        match = re.search(r'Total MAC Addresses for this criterion:\s*(\d+)', output, re.IGNORECASE)
+        if match:
+            try:
+                count = int(match.group(1))
+                self._log(f"    - Contados {count} dispositivos (MACs) via sumário da tabela.\n")
+                return count
+            except:
+                pass  # Continua para o fallback
+
+        # Fallback: Contar linhas que são MAC addresses dinâmicos
+        mac_count = 0
+        mac_pattern = re.compile(r'([0-9a-f]{2}[:\.-]){5}[0-9a-f]{2}', re.IGNORECASE)
+        for line in output.splitlines():
+            # Procura por um MAC e a palavra 'dynamic' para evitar contar entradas estáticas/sistema
+            if mac_pattern.search(line) and 'dynamic' in line.lower():
+                mac_count += 1
+
+        if mac_count > 0:
+            self._log(f"    - Contados {mac_count} dispositivos (MACs) via contagem de linhas 'dynamic'.\n")
+            return mac_count
+
+        self._log("    - Tabela MAC parecia vazia ou não foi possível parsear. Contagem de dispositivos é 0.\n")
+        return 0

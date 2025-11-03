@@ -18,7 +18,7 @@ except ImportError:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Ferramenta de Diagnóstico de Switch v14.6 (Busca Corrigida)")
+        self.root.title("Ferramenta de Diagnóstico de Switch v14.7 (Uso de IP + Logs PoE)")
         self.root.geometry("850x800")
 
         # --- Carregar Dados ---
@@ -77,7 +77,7 @@ class App:
             "classify_clients": tk.BooleanVar(value=True),
             "neighbors": tk.BooleanVar(value=True),
             "clients": tk.BooleanVar(value=True),
-            "ip_usage": tk.BooleanVar(value=True),
+            "ip_usage": tk.BooleanVar(value=True), # <--- ADICIONADO
             "health": tk.BooleanVar(value=True),
             "port_errors": tk.BooleanVar(value=True),
             "vlans": tk.BooleanVar(value=True),
@@ -103,16 +103,15 @@ class App:
         ttk.Checkbutton(col1_frame, text="Ping Vizinhos", variable=self.test_vars["neighbors"]).pack(anchor="w")
         ttk.Checkbutton(col1_frame, text="Ping Clientes (Cabo)", variable=self.test_vars["clients"]).pack(anchor="w")
 
+        ttk.Checkbutton(col2_frame, text="Uso de IP (Rede/Máscara)", variable=self.test_vars["ip_usage"]).pack(anchor="w") # <--- ADICIONADO
         ttk.Checkbutton(col2_frame, text="Saúde (CPU/Mem)", variable=self.test_vars["health"]).pack(anchor="w")
-        ttk.Checkbutton(col2_frame, text="Uso de IP (Rede/Máscara)", variable=self.test_vars["ip_usage"]).pack(
-            anchor="w")
         ttk.Checkbutton(col2_frame, text="Erros Portas", variable=self.test_vars["port_errors"]).pack(anchor="w")
         ttk.Checkbutton(col2_frame, text="VLANs", variable=self.test_vars["vlans"]).pack(anchor="w")
         ttk.Checkbutton(col2_frame, text="Status PoE", variable=self.test_vars["poe"]).pack(anchor="w")
 
         ttk.Checkbutton(col3_frame, text="Proteção Loop", variable=self.test_vars["loop_protection"]).pack(anchor="w")
         ttk.Checkbutton(col3_frame, text="Loops Ativos", variable=self.test_vars["active_loops"]).pack(anchor="w")
-        ttk.Checkbutton(col3_frame, text="Logs DHCP", variable=self.test_vars["dhcp_logs"]).pack(anchor="w")
+        ttk.Checkbutton(col3_frame, text="Logs (DHCP/PoE)", variable=self.test_vars["dhcp_logs"]).pack(anchor="w") # Texto atualizado
 
         btn_frame = ttk.Frame(tests_frame)
         btn_frame.pack(fill='x', pady=(5, 0), padx=5)
@@ -240,7 +239,8 @@ class App:
     def _skipped_summary(self, test_name):
         return f"⚪ {test_name}: NÃO EXECUTADO (desmarcado pelo usuário)\n\n"
 
-    def generate_and_display_summary(self, data):
+    # --- FUNÇÃO DE RESUMO MODIFICADA (DUPLICADA DO ORCHESTRATOR) ---
+    def generate_and_display_summary(self, data, tests_selected):
         summary = "\n\n==================== RESUMO DO DIAGNÓSTICO ====================\n\n"
 
         skipped_summary = self._skipped_summary
@@ -264,13 +264,15 @@ class App:
                     friendly_names = {
                         'neighbors': 'Teste de Vizinhança',
                         'clients': 'Teste de Clientes',
+                        'ip_usage': 'Verificação de Uso de IP', # <--- ADICIONADO
                         'health_status': 'Saúde do Switch',
                         'port_errors': 'Verificação de Erros nas Portas',
                         'vlan_status': 'Verificação de VLANs',
                         'poe_status': 'Status do PoE',
                         'loopback': 'Proteção Contra Loops',
                         'active_loop': 'Verificação de Loops Ativos',
-                        'dhcp_logs': 'Verificação de Logs DHCP'
+                        'dhcp_logs': 'Verificação de Logs DHCP',
+                        'poe_log_errors': 'Verificação de Logs PoE' # <--- ADICIONADO
                     }
                     skipped_lines.append(skipped_summary(friendly_names.get(test_name, test_name)))
 
@@ -302,6 +304,20 @@ class App:
             op_status = operadora_ping.get('status', 'Falha')
             op_icon = "✅" if op_status == "Sucesso" else "❌"
             executed_lines.append(f"{op_icon} Ping Switch Operadora ({op_ip}): {op_status.upper()}")
+
+        # --- BLOCO NOVO: USO DE IP ---
+        ip_usage_data = data.get('ip_usage', {})
+        if ip_usage_data.get('skipped'):
+            skipped_lines.append(skipped_summary("Verificação de Uso de IP"))
+        elif ip_usage_data.get('total'):
+            used, total, mask = ip_usage_data['used'], ip_usage_data['total'], ip_usage_data['mask']
+            percent = (used / total) * 100 if total > 0 else 0
+            icon = "⚠️" if percent > 85 else "✅" # Alerta se uso for > 85%
+            executed_lines.append(f"{icon} Utilização de IP: {used} de {total} IPs em uso ({percent:.1f}%)")
+            executed_lines.append(f"   - Máscara de Rede: {mask}")
+        else:
+            executed_lines.append(f"⚠️ Utilização de IP: {ip_usage_data.get('used', 0)} IPs contados (Não foi possível obter máscara/total).")
+
 
         health_status = data.get('health_status', {})
         if health_status.get('skipped'):
@@ -407,9 +423,10 @@ class App:
             else:
                 executed_lines.append(f"✅ Verificação de Loops Ativos: Nenhum loop encontrado no momento.")
 
+        # --- BLOCO DE LOGS DHCP (MODIFICADO) ---
         dhcp_logs_data = data.get('dhcp_logs', {})
         if dhcp_logs_data.get('skipped'):
-            skipped_lines.append(skipped_summary("Verificação de Logs DHCP"))
+            skipped_lines.append(skipped_summary("Verificação de Logs (DHCP/PoE)"))
         else:
             log_status_msg = dhcp_logs_data.get('status', 'Não verificado')
             log_lines = dhcp_logs_data.get('lines', [])
@@ -420,6 +437,23 @@ class App:
                 executed_lines.append(f"✅ Verificação de Logs DHCP: Nenhum erro encontrado nos logs recentes.")
             else:
                 executed_lines.append(f"⚠️ Verificação de Logs DHCP: {log_status_msg}.")
+
+        # --- BLOCO NOVO: LOGS POE ---
+        poe_logs_data = data.get('poe_log_errors', {})
+        if poe_logs_data.get('skipped'):
+            # Já tratado pelo skip do DHCP
+            pass
+        else:
+            poe_log_status_msg = poe_logs_data.get('status', 'Não verificado')
+            poe_log_lines = poe_logs_data.get('lines', [])
+            if "ERROS PoE ENCONTRADOS" in poe_log_status_msg:
+                executed_lines.append(f"❌ Verificação de Logs PoE: ERROS ENCONTRADOS!")
+                executed_lines.append(f"   - Exemplo: {poe_log_lines[0] if poe_log_lines else 'N/A'}")
+            elif "Nenhum erro" in poe_log_status_msg:
+                executed_lines.append(f"✅ Verificação de Logs PoE: Nenhum erro encontrado nos logs recentes.")
+            else:
+                executed_lines.append(f"⚠️ Verificação de Logs PoE: {poe_log_status_msg}.")
+
 
         # --- Agora, constrói a string final do sumário ---
         if executed_lines:
@@ -433,37 +467,8 @@ class App:
         summary += "\n===============================================================\n"
         self.update_results(summary)
 
-    def save_log_to_file(self):
-        log_content = self.results_text.get("1.0", tk.END)
-        if not log_content.strip():
-            messagebox.showwarning("Aviso", "Não há resultados para salvar.")
-            return
-
-        default_filename = "log_diagnostico.txt"
-        if self.selected_school_name:
-            safe_school_name = re.sub(r'[\\/*?:"<>|]', "", self.selected_school_name)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")  # Esta linha agora usa o módulo 'time'
-            default_filename = f"log_{safe_school_name}_{timestamp}.txt"
-
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Arquivos de Texto", "*.txt"), ("Todos os Arquivos", "*.*")],
-            initialfile=default_filename,
-            title="Salvar Log Como..."
-        )
-
-        if not filepath: return
-
-        try:
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(log_content)
-            messagebox.showinfo("Sucesso", f"Log salvo com sucesso em:\n{filepath}")
-        except Exception as e:
-            messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar o arquivo.\nDetalhes: {e}")
-
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
     root.mainloop()
-
