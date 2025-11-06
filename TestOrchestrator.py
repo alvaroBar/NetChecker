@@ -87,9 +87,13 @@ class TestOrchestrator:
             self.view.update_results("PASSO 1: Conectando e identificando o switch...\n")
             tester = SwitchTester(host=ip_switch, username=username, password=password,
                                   update_callback=self.view.update_results)
-            connected, model = tester.connect_and_identify()
+
+            # --- CHAMADA MODIFICADA ---
+            connected, model, error_type = tester.connect_and_identify()
             summary_data['connection'] = connected
             summary_data['model'] = model
+            summary_data['error_type'] = error_type  # Salva o tipo de erro
+            # --- FIM DA MODIFICAÇÃO ---
 
             if not connected:
                 self.view.update_results(
@@ -131,7 +135,6 @@ class TestOrchestrator:
                     summary_data['operadora_ping'] = {'skipped': True}
 
                 all_devices, neighbors_found, clients_found = [], [], []
-                # Executa a descoberta de dispositivos (baseada em IP/ARP) se *qualquer* teste de ping estiver selecionado
                 if tests_selected['neighbors'] or tests_selected['clients'] or tests_selected['classify_clients']:
                     if tests_selected['classify_clients']:
                         self.view.update_results(
@@ -156,16 +159,11 @@ class TestOrchestrator:
                     self.view.update_results(
                         f"  - Total de {len(all_devices)} dispositivos (baseados em IP/ARP) encontrados para ping.\n\n")
 
-                # --- PASSO USO DE IP (MODIFICADO) ---
                 if tests_selected['ip_usage']:
                     self.view.update_results(f"PASSO {step}: Verificando Uso de IP (Contagem de MACs)...\n");
                     step += 1
-                    # 1. Busca o total de IPs pela máscara
                     network_info = tester.get_network_info()
-
-                    # 2. Busca os IPs em uso pela contagem da tabela MAC
                     used_hosts = tester.get_mac_address_count()
-
                     summary_data['ip_usage'] = {
                         'used': used_hosts,
                         'total': network_info.get('total_hosts'),
@@ -174,7 +172,6 @@ class TestOrchestrator:
                     self.view.update_results("\n")
                 else:
                     summary_data['ip_usage'] = {'skipped': True}
-                # --- FIM DA MODIFICAÇÃO ---
 
                 if tests_selected['neighbors']:
                     self.view.update_results(f"PASSO {step}: Testando Vizinhos (Infraestrutura)...\n");
@@ -317,8 +314,18 @@ class TestOrchestrator:
         executed_lines = []
         skipped_lines = []
 
+        # --- SEÇÃO DE FALHA DE CONEXÃO MODIFICADA ---
         if not data.get('connection'):
-            summary += f"❌ Conexão com o Switch da Escola: FALHA\n\n"
+            error_type = data.get('error_type')
+
+            if error_type == "CRYPTOGRAPHY_ERROR":
+                summary += f"❌ Conexão com o Switch da Escola: FALHA (Erro de Criptografia)\n\n"
+                summary += f"   MOTIVO: O switch está usando um firmware antigo com algoritmos SSH\n"
+                summary += f"           criptograficamente inseguros ou 'quebrados'.\n"
+                summary += f"   AÇÃO RECOMENDADA: Atualizar o firmware do switch para a versão mais recente.\n\n"
+            else:
+                summary += f"❌ Conexão com o Switch da Escola: FALHA (Motivo: {error_type})\n\n"
+
             operadora_ping = data.get('operadora_ping', {})
             if not operadora_ping.get('skipped', True) and operadora_ping.get('local'):
                 op_ip = operadora_ping.get('ip', 'N/A')
@@ -356,11 +363,13 @@ class TestOrchestrator:
             summary += "\n===============================================================\n"
             self.view.update_results(summary)
             return
+        # --- FIM DA SEÇÃO DE FALHA ---
 
         summary += f"✅ Conexão com o Switch da Escola: SUCESSO\n"
         summary += f"   - Modelo do Switch Identificado: {data.get('model', 'N/A').upper()}\n\n"
 
-        if all(val == {'skipped': True} for key, val in data.items() if key not in ['connection', 'model']):
+        if all(val == {'skipped': True} for key, val in data.items() if
+               key not in ['connection', 'model', 'error_type']):
             summary += "⚪ Nenhum teste foi selecionado para execução.\n\n"
             self.view.update_results(summary)
             return

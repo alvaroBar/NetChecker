@@ -82,25 +82,44 @@ class SwitchTester:
             'global_delay_factor': 2,
         }
 
+        is_crypto_error = False  # Flag para rastrear nosso erro específico
+
+        # 1. Tentar conexão moderna
         try:
             self._log(f"  - Tentando conexão SSH padrão (perfil: {base_device_info['device_type']})...\n")
             self.connection = ConnectHandler(**base_device_info)
+            self._log("  - Conexão padrão bem-sucedida.\n")
 
-        except Exception as e:
-            if "no acceptable host key" in str(e).lower() or "incompatible ssh peer" in str(e).lower():
-                self._log("  [AVISO] O switch parece ser um modelo mais antigo. Tentando método de conexão legado...\n")
-                try:
-                    legacy_device_info = base_device_info.copy()
-                    legacy_device_info['device_type'] = 'generic'
-                    legacy_device_info['disabled_algorithms'] = dict(pubkeys=[], kex=[])
-                    self.connection = ConnectHandler(**legacy_device_info)
-                except Exception as e_legacy:
-                    self._log(f"  [ERRO] A tentativa de conexão legada também falhou.\n     Detalhes: {e_legacy}\n")
-                    return False, self.model
-            else:
-                self._log(f"  [ERRO] Falha na conexão inicial.\n     Detalhes: {e}\n")
-                return False, self.model
+        except Exception as e_moderna:
+            self._log(f"  [AVISO] Conexão padrão falhou. Detalhes: {e_moderna}\n")
+            if "p must be exactly" in str(e_moderna):
+                is_crypto_error = True
 
+            # 2. Tentar conexão legada manual (sabemos que vai falhar no switch quebrado)
+            self._log("  - Tentando método de conexão legado manual ('generic')...\n")
+            try:
+                legacy_device_info = base_device_info.copy()
+                legacy_device_info['device_type'] = 'generic'
+                legacy_device_info['disabled_algorithms'] = {
+                    'kex': ['diffie-hellman-group-exchange-sha1', 'diffie-hellman-group-exchange-sha256'],
+                    'server_host_keys': ['ssh-dss'],
+                    'ciphers': [],
+                    'macs': []
+                }
+                self.connection = ConnectHandler(**legacy_device_info)
+                self._log("  - Conexão legada manual bem-sucedida.\n")
+
+            except Exception as e_legacy:
+                # 3. Se a legada também falhar, retornar o tipo de erro
+                self._log(f"  [ERRO] A tentativa de conexão legada manual também falhou.\n     Detalhes: {e_legacy}\n")
+                if "p must be exactly" in str(e_legacy):
+                    is_crypto_error = True
+
+                # RETORNO MODIFICADO
+                error_type = "CRYPTOGRAPHY_ERROR" if is_crypto_error else "GENERIC_FAILURE"
+                return False, self.model, error_type
+
+        # 4. Se chegou aqui, uma das conexões funcionou. Agora, tentar 'enable'.
         try:
             self._log("  - Conexão estabelecida. Executando comando 'enable'...\n")
             self.connection.enable()
@@ -118,7 +137,10 @@ class SwitchTester:
                     self.connection.disconnect()
                 except:
                     pass
-            return False, self.model
+            # RETORNO MODIFICADO
+            return False, self.model, "ENABLE_FAILURE"
+
+        # ... O resto da função (identificação do modelo) continua igual ...
 
         self._log("  - Buscando informações para identificar o modelo do switch...\n")
 
@@ -148,7 +170,10 @@ class SwitchTester:
         if not identified:
             self._log("  [AVISO] Não foi possível identificar o modelo com os perfis conhecidos.\n")
 
-        return True, self.model
+        # RETORNO MODIFICADO
+        return True, self.model, None
+
+    # ... (O resto do arquivo SwitchTester.py continua exatamente igual) ...
 
     def disconnect(self):
         if self.connection:
@@ -453,18 +478,15 @@ class SwitchTester:
             self._log(f"  [ERRO] Não foi possível calcular o tamanho da rede com ip={ip}, mask={mask}. Detalhes: {e}\n")
             return {'total_hosts': None, 'mask': mask}
 
-    # --- NOVA FUNÇÃO ---
     def get_mac_address_count(self):
         """
         Conta o número de dispositivos conectados com base na tabela MAC.
         """
-        # Não loga a saída bruta (log_output=False), apenas o resultado.
         output, _ = self._execute_command_list('mac_table', log_output=False)
         if output is None:
             self._log("    - Não foi possível executar 'show mac address-table' para contar dispositivos.\n")
             return 0
 
-        # Tenta o método mais confiável (parsear o total do TPLINK, como visto no seu log)
         match = re.search(r'Total MAC Addresses for this criterion:\s*(\d+)', output, re.IGNORECASE)
         if match:
             try:
@@ -472,13 +494,11 @@ class SwitchTester:
                 self._log(f"    - Contados {count} dispositivos (MACs) via sumário da tabela.\n")
                 return count
             except:
-                pass  # Continua para o fallback
+                pass
 
-        # Fallback: Contar linhas que são MAC addresses dinâmicos
         mac_count = 0
         mac_pattern = re.compile(r'([0-9a-f]{2}[:\.-]){5}[0-9a-f]{2}', re.IGNORECASE)
         for line in output.splitlines():
-            # Procura por um MAC e a palavra 'dynamic' para evitar contar entradas estáticas/sistema
             if mac_pattern.search(line) and 'dynamic' in line.lower():
                 mac_count += 1
 
