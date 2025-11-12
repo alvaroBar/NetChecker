@@ -1,9 +1,7 @@
 import re
 import time
-import ipaddress
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
-
 
 class SwitchTester:
     COMMANDS = {
@@ -11,7 +9,6 @@ class SwitchTester:
             'identify_cmd': ['show system-info'],
             'identify_keyword': 'TP-Link',
             'all_devices': ['show arp'],
-            'ip_interface': ['show ip interface vlan 10'],
             'loopback': ['show loopback-detection global'],
             'loop_status': ['show loopback-detection interface'],
             'cpu_util': ['show cpu-utilization'],
@@ -26,9 +23,8 @@ class SwitchTester:
         },
         'edgecore': {
             'identify_cmd': ['show system'],
-            'identify_keyword': 'Edge-Core',
+            'identify_keyword': 'ECS2100',
             'all_devices': ['show arp'],
-            'ip_interface': ['show ip interface vlan 10'],
             'loopback': ['show loop-detection'],
             'loop_status': [],
             'cpu_util': [],
@@ -44,7 +40,6 @@ class SwitchTester:
         'unknown': {
             'identify_cmd': ['show version'],
             'all_devices': ['show arp'],
-            'ip_interface': [],
             'loopback': [],
             'loop_status': [],
             'cpu_util': [],
@@ -69,82 +64,131 @@ class SwitchTester:
 
     def _log(self, message):
         if self.update_callback:
-            self.update_callback(message)
+             self.update_callback(message)
 
     def connect_and_identify(self):
-        base_device_info = {
-            'device_type': 'tplink_jetstream',
+        """
+        Tenta conectar ao switch usando múltiplos métodos:
+        SSH Padrão, SSH Legado (fallback), Telnet Específico (EdgeCore) e Telnet Genérico (fallback).
+        """
+        base_device_config = {
             'host': self.host_ip,
             'username': self.username,
             'password': self.password,
-            'secret': self.password,
-            'conn_timeout': 20,
+            'secret': self.password,  # Usado para o comando 'enable'
+            'conn_timeout': 15,
             'global_delay_factor': 2,
         }
 
-        is_crypto_error = False  # Flag para rastrear nosso erro específico
+        connection_protocol = None
 
-        # 1. Tentar conexão moderna
+        # --- TENTATIVA 1: SSH PADRÃO ---
+        self._log(f"  - Tentativa 1: Conexão SSH padrão (perfil: tplink_jetstream)...\n")
+        ssh_params = base_device_config.copy()
+        ssh_params['device_type'] = 'tplink_jetstream'
+
         try:
-            self._log(f"  - Tentando conexão SSH padrão (perfil: {base_device_info['device_type']})...\n")
-            self.connection = ConnectHandler(**base_device_info)
-            self._log("  - Conexão padrão bem-sucedida.\n")
+            self.connection = ConnectHandler(**ssh_params)
+            connection_protocol = 'ssh'
 
-        except Exception as e_moderna:
-            self._log(f"  [AVISO] Conexão padrão falhou. Detalhes: {e_moderna}\n")
-            if "p must be exactly" in str(e_moderna):
-                is_crypto_error = True
+        except Exception as e_ssh:
+            error_str = str(e_ssh).lower()
 
-            # 2. Tentar conexão legada manual (sabemos que vai falhar no switch quebrado)
-            self._log("  - Tentando método de conexão legado manual ('generic')...\n")
+            if "no acceptable host key" in error_str or "incompatible ssh peer" in error_str:
+                # --- TENTATIVA 2: SSH LEGADO ---
+                self._log("  [AVISO] SSH padrão falhou (incompatibilidade de criptografia).\n")
+                self._log("  - Tentativa 2: Conexão SSH Legada (perfil: generic)...\n")
+                try:
+                    legacy_params = base_device_config.copy()
+                    legacy_params['device_type'] = 'generic'
+                    legacy_params['disabled_algorithms'] = dict(pubkeys=[], kex=[])
+                    self.connection = ConnectHandler(**legacy_params)
+                    connection_protocol = 'ssh'
+
+                except Exception as e_legacy:
+                    self._log(f"  [AVISO] SSH Legado também falhou. Partindo para Telnet.\n    Detalhes: {e_legacy}\n")
+                    self.connection = None
+
+            else:
+                self._log(f"  [AVISO] SSH padrão falhou. Partindo para Telnet.\n    Detalhes: {e_ssh}\n")
+                self.connection = None
+
+        # --- TENTATIVA 3: TELNET (EDGECORE) ---
+        # Adicionamos esta nova tentativa específica para o EdgeCore
+        if self.connection is None:
+            self._log(f"  - Tentativa 3: Conexão Telnet (perfil: edgecore_ecs_telnet)...\n")
             try:
-                legacy_device_info = base_device_info.copy()
-                legacy_device_info['device_type'] = 'generic'
-                legacy_device_info['disabled_algorithms'] = {
-                    'kex': ['diffie-hellman-group-exchange-sha1', 'diffie-hellman-group-exchange-sha256'],
-                    'server_host_keys': ['ssh-dss'],
-                    'ciphers': [],
-                    'macs': []
-                }
-                self.connection = ConnectHandler(**legacy_device_info)
-                self._log("  - Conexão legada manual bem-sucedida.\n")
+                telnet_params = base_device_config.copy()
+                telnet_params['device_type'] = 'edgecore_ecs_telnet'
+                self.connection = ConnectHandler(**telnet_params)
+                connection_protocol = 'telnet'
 
-            except Exception as e_legacy:
-                # 3. Se a legada também falhar, retornar o tipo de erro
-                self._log(f"  [ERRO] A tentativa de conexão legada manual também falhou.\n     Detalhes: {e_legacy}\n")
-                if "p must be exactly" in str(e_legacy):
-                    is_crypto_error = True
+            except Exception as e_edgecore_telnet:
+                self._log(f"  [AVISO] Telnet (EdgeCore) falhou. Partindo para Telnet genérico.\n    Detalhes: {e_edgecore_telnet}\n")
+                self.connection = None # Garante que está Nulo para a próxima tentativa
 
-                # RETORNO MODIFICADO
-                error_type = "CRYPTOGRAPHY_ERROR" if is_crypto_error else "GENERIC_FAILURE"
-                return False, self.model, error_type
+        # --- TENTATIVA 4: TELNET (Genérico) ---
+        # Esta era a sua TENTATIVA 3, agora é a 4 (fallback)
+        if self.connection is None:
+            self._log(f"  - Tentativa 4: Conexão Telnet (perfil: generic_telnet)...\n")
+            try:
+                telnet_params = base_device_config.copy()
+                telnet_params['device_type'] = 'generic_telnet'
+                telnet_params['global_cmd_verify'] = False
+                self.connection = ConnectHandler(**telnet_params)
+                connection_protocol = 'telnet'
 
-        # 4. Se chegou aqui, uma das conexões funcionou. Agora, tentar 'enable'.
+            except Exception as e_telnet:
+                self._log(f"  [ERRO] Conexão Telnet genérica também falhou.\n    Detalhes: {e_telnet}\n")
+                self._log("\n[FALHA GERAL] Não foi possível conectar ao switch via SSH ou Telnet.\n")
+                return False, self.model
+
+        self._log(f"  [OK] Conexão estabelecida com sucesso.\n")
+
+        if connection_protocol == 'ssh':
+            # --- LÓGICA PARA TPLINK (SSH) ---
+            try:
+                self._log("  - Executando comando 'enable' (método SSH)...\n")
+                self.connection.enable()
+                self._log("  - Modo privilegiado ativado.\n")
+                time.sleep(0.5)
+            except Exception as e:
+                self._log(f"  [ERRO] Falha ao entrar no modo privilegiado SSH.\n     Detalhes: {e}\n")
+                if self.connection: self.connection.disconnect()
+                return False, self.model
+
+        elif connection_protocol == 'telnet':
+            # --- LÓGICA PARA EDGECORE (TELNET) ---
+            # Correto: Pula o 'enable' pois o log do PuTTY mostrou login direto em '#'.
+            self._log("  [AVISO] Conexão via Telnet. Pulando 'enable' (login direto para '#').\n")
+            pass
+
+        # --- INÍCIO DA CORREÇÃO DE PAGINAÇÃO ---
+        # Removemos a verificação 'if connection_protocol == 'ssh'
+        # O disable_paging() deve ser tentado em AMBOS os protocolos.
+        # O Netmiko sabe o comando certo para cada device_type.
         try:
-            self._log("  - Conexão estabelecida. Executando comando 'enable'...\n")
-            self.connection.enable()
-            self._log("  - Modo privilegiado ativado.\n")
-            time.sleep(0.5)
-            self._log("  - Desativando paginação do terminal (comando: 'terminal length 0')...\n")
-            self.connection.send_command_timing('terminal length 0')
+            self._log("  - Desativando paginação do terminal (método: disable_paging)...\n")
+            self.connection.disable_paging()
             time.sleep(0.5)
             self._log("  - Paginação desativada.\n")
-            time.sleep(0.5)
-        except Exception as e:
-            self._log(f"  [ERRO] Falha ao entrar no modo privilegiado ou desativar paginação.\n     Detalhes: {e}\n")
-            if self.connection:
-                try:
-                    self.connection.disconnect()
-                except:
-                    pass
-            # RETORNO MODIFICADO
-            return False, self.model, "ENABLE_FAILURE"
+        except Exception as e_pagination:
+            self._log(f"    [AVISO] Não foi possível desativar paginação (erro: {e_pagination}).\n")
+            if self.connection and not self.connection.is_alive():
+                self._log("  [ERRO] A conexão foi perdida durante 'disable_paging'.\n")
+                return False, self.model
+            pass # Continua mesmo se falhar
 
-        # ... O resto da função (identificação do modelo) continua igual ...
+        # Removemos a lógica de "Limpeza de Buffer" que só rodava para Telnet,
+        # pois agora o disable_paging() trata disso.
+        # --- FIM DA CORREÇÃO DE PAGINAÇÃO ---
 
-        self._log("  - Buscando informações para identificar o modelo do switch...\n")
 
-        models_to_try = ['tplink', 'edgecore']
+        # --- INÍCIO DA CORREÇÃO DE LÓGICA ---
+        # Invertemos a ordem. Tentamos EdgeCore PRIMEIRO.
+        models_to_try = ['edgecore', 'tplink']
+        # --- FIM DA CORREÇÃO DE LÓGICA ---
+
         identified = False
         for model_name in models_to_try:
             try:
@@ -153,7 +197,7 @@ class SwitchTester:
                 keyword = model_profile['identify_keyword']
 
                 self._log(f"    - Executando verificação para {model_name.upper()} com o comando: '{command}'\n")
-                output = self.connection.send_command(command, read_timeout=15)
+                output = self.connection.send_command(command, read_timeout=30)
 
                 if output and (
                         keyword.lower() in output.lower() or (model_name == 'tplink' and 'omada' in output.lower())):
@@ -163,17 +207,26 @@ class SwitchTester:
                     break
                 else:
                     self._log(f"      (Não corresponde ao perfil {model_name.upper()})\n")
-            except Exception:
-                self._log(f"      [AVISO] Comando para perfil {model_name.upper()} falhou ou expirou.\n")
+
+            except Exception as e:
+                self._log(
+                    f"      [AVISO] Comando para perfil {model_name.upper()} falhou ou expirou.\n      Detalhes: {e}\n")
+
+                # --- INÍCIO DA VERIFICAÇÃO DE SEGURANÇA ---
+                # Se o comando MATOU a conexão, paramos o teste.
+                if "10053" in str(e) or (self.connection and not self.connection.is_alive()):
+                    self._log("  [ERRO] A conexão com o switch foi PERDIDA durante a identificação.\n")
+                    return False, self.model  # Retorna a falha
+
+                # Se foi só um timeout ou comando inválido, a conexão está viva,
+                # então podemos 'continue' para o próximo modelo.
                 continue
+                # --- FIM DA VERIFICAÇÃO DE SEGURANÇA ---
 
         if not identified:
             self._log("  [AVISO] Não foi possível identificar o modelo com os perfis conhecidos.\n")
 
-        # RETORNO MODIFICADO
-        return True, self.model, None
-
-    # ... (O resto do arquivo SwitchTester.py continua exatamente igual) ...
+        return True, self.model
 
     def disconnect(self):
         if self.connection:
@@ -278,6 +331,25 @@ class SwitchTester:
         command = f"ping {destination_ip}"
         self._log(f"    - Testando ping para {destination_ip}... \n")
         self._log(f"      - Executando: '{command}'\n")
+
+        try:
+            # Adiciona um pequeno delay para estabilizar sessões Telnet
+            time.sleep(1)
+            output = self.connection.send_command(command, read_timeout=20)
+            self._log(f"      - Saída do Ping: {output.strip()}\n")
+
+            output_lower = output.lower()
+            if "0% loss" in output_lower or "reply from" in output_lower:
+                return "Sucesso"
+            return "Falha"
+
+        except EOFError:
+            self._log("      [ERRO] Conexão Telnet encerrada inesperadamente durante o ping.\n")
+            return "Falha (Telnet fechado)"
+        except Exception as e:
+            self._log(f"      [ERRO] Falha ao executar ping: {e}\n")
+            return "Falha (erro inesperado)"
+
         output = self.connection.send_command(command, read_timeout=20)
         self._log(f"      - Saída do Ping: {output.strip()}\n")
 
@@ -337,34 +409,7 @@ class SwitchTester:
                     ports_with_errors.append(port_name)
 
         if not in_error_section:
-            port_name = None
-            port_errors = 0
-            port_discards = 0
-            for line_log in output.splitlines():
-                if line_log.startswith("Port:"):
-                    if port_name and (port_errors > 0 or port_discards > 0):
-                        ports_with_errors.append(f"{port_name} (Errors: {port_errors}, Discards: {port_discards})")
-                    port_name = line_log.split(':')[-1].strip()
-                    port_errors = 0
-                    port_discards = 0
-                elif "Rx Errors:" in line_log or "Tx Errors:" in line_log:
-                    try:
-                        port_errors += int(line_log.split(':')[-1].strip().replace(',', ''))
-                    except:
-                        pass
-                elif "Rx Discards:" in line_log or "Tx Discards:" in line_log:
-                    try:
-                        port_discards += int(line_log.split(':')[-1].strip().replace(',', ''))
-                    except:
-                        pass
-
-            if port_name and (port_errors > 0 or port_discards > 0):
-                ports_with_errors.append(f"{port_name} (Errors: {port_errors}, Discards: {port_discards})")
-
-            if ports_with_errors:
-                return "ERROS ENCONTRADOS!", list(set(ports_with_errors))
             return "Nenhuma informação de erro de porta encontrada", []
-
         if ports_with_errors:
             return "ERROS ENCONTRADOS!", list(set(ports_with_errors))
         return "Nenhum erro encontrado nas portas", []
@@ -386,7 +431,7 @@ class SwitchTester:
 
     def check_poe_status(self):
         output, _ = self._execute_command_list('poe_status')
-        if output is None: return None
+        if output is None: return {}
         poe_data = {}
         patterns = {
             'limit': r"power limit\s*:\s*(\d+\.?\d*)\s*w",
@@ -398,113 +443,17 @@ class SwitchTester:
                 poe_data[key] = float(match.group(1))
         return poe_data
 
-    def check_system_logs(self):
+    def check_dhcp_logs(self):
         output, _ = self._execute_command_list('logs')
-        if output is None:
-            return {
-                'dhcp': {'status': "Não foi possível verificar logs", 'lines': []},
-                'poe': {'status': "Não foi possível verificar logs", 'lines': []}
-            }
+        if output is None: return "Não foi possível verificar logs", []
 
-        dhcp_error_lines = []
+        error_lines = []
         dhcp_error_keywords = ["deny", "fail", "untrusted", "exceeded", "error"]
-
-        poe_error_lines = []
-        poe_error_keywords = ["overloading", "over 30 watts", "power supply status.*off"]
 
         for line in output.splitlines():
             line_lower = line.lower()
-
             if 'dhcp' in line_lower and any(keyword in line_lower for keyword in dhcp_error_keywords):
-                dhcp_error_lines.append(line.strip())
+                error_lines.append(line.strip())
 
-            if 'poe' in line_lower and any(re.search(keyword, line_lower) for keyword in poe_error_keywords):
-                if "power supply status of port" in line_lower and "changes from off to on" in line_lower:
-                    continue
-                poe_error_lines.append(line.strip())
-
-        return {
-            'dhcp': {
-                'status': "ERROS DHCP ENCONTRADOS!" if dhcp_error_lines else "Nenhum erro DHCP encontrado nos logs recentes",
-                'lines': dhcp_error_lines
-            },
-            'poe': {
-                'status': "ERROS PoE ENCONTRADOS!" if poe_error_lines else "Nenhum erro PoE encontrado nos logs recentes",
-                'lines': poe_error_lines
-            }
-        }
-
-    def get_network_info(self):
-        output, _ = self._execute_command_list('ip_interface')
-        ip, mask = None, None
-
-        if output:
-            ip_match = re.search(r'(?:IP-Addr|IP Address)\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', output,
-                                 re.IGNORECASE)
-            mask_match = re.search(r'(?:Subnet-Mask|Subnet Mask)\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', output,
-                                   re.IGNORECASE)
-
-            if ip_match:
-                ip = ip_match.group(1)
-            if mask_match:
-                mask = mask_match.group(1)
-
-            if not ip or not mask:
-                match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
-                                  output)
-                if match:
-                    ip, mask = match.group(1), match.group(2)
-
-        if not ip or not mask:
-            self._log("    - Falha ao extrair máscara da interface. Tentando via logs de inicialização...\n")
-            output_logs, _ = self._execute_command_list('logs', log_output=False)
-
-            if output_logs:
-                log_match = re.search(r'set primary ip\s+([0-9.]+)\s+mask\s+([0-9.]+)', output_logs, re.IGNORECASE)
-                if log_match:
-                    self._log("    - Máscara encontrada no log de inicialização.\n")
-                    ip, mask = log_match.group(1), log_match.group(2)
-
-        if not ip or not mask:
-            self._log("    - Não foi possível encontrar a máscara de rede.\n")
-            return {'total_hosts': None, 'mask': 'Não encontrado'}
-
-        try:
-            net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
-            total_hosts = net.num_addresses - 2 if net.num_addresses > 2 else net.num_addresses
-            self._log(f"    - Rede: {net.network_address}, Máscara: {mask}, Total de IPs: {total_hosts}\n")
-            return {'total_hosts': total_hosts, 'mask': mask}
-        except Exception as e:
-            self._log(f"  [ERRO] Não foi possível calcular o tamanho da rede com ip={ip}, mask={mask}. Detalhes: {e}\n")
-            return {'total_hosts': None, 'mask': mask}
-
-    def get_mac_address_count(self):
-        """
-        Conta o número de dispositivos conectados com base na tabela MAC.
-        """
-        output, _ = self._execute_command_list('mac_table', log_output=False)
-        if output is None:
-            self._log("    - Não foi possível executar 'show mac address-table' para contar dispositivos.\n")
-            return 0
-
-        match = re.search(r'Total MAC Addresses for this criterion:\s*(\d+)', output, re.IGNORECASE)
-        if match:
-            try:
-                count = int(match.group(1))
-                self._log(f"    - Contados {count} dispositivos (MACs) via sumário da tabela.\n")
-                return count
-            except:
-                pass
-
-        mac_count = 0
-        mac_pattern = re.compile(r'([0-9a-f]{2}[:\.-]){5}[0-9a-f]{2}', re.IGNORECASE)
-        for line in output.splitlines():
-            if mac_pattern.search(line) and 'dynamic' in line.lower():
-                mac_count += 1
-
-        if mac_count > 0:
-            self._log(f"    - Contados {mac_count} dispositivos (MACs) via contagem de linhas 'dynamic'.\n")
-            return mac_count
-
-        self._log("    - Tabela MAC parecia vazia ou não foi possível parsear. Contagem de dispositivos é 0.\n")
-        return 0
+        if error_lines: return "ERROS DHCP ENCONTRADOS!", error_lines
+        return "Nenhum erro DHCP encontrado nos logs recentes", []

@@ -5,8 +5,16 @@ import csv
 import re
 import time
 import threading
+import os
 
-# Importa a classe controladora
+# Importa a nova biblioteca para ler .xlsx
+try:
+    import openpyxl
+except ImportError:
+    messagebox.showerror("Erro Crítico",
+                         "Biblioteca 'openpyxl' não encontrada.\nPor favor, execute: pip install openpyxl")
+    exit()
+
 try:
     from TestOrchestrator import TestOrchestrator
 except ImportError:
@@ -18,14 +26,14 @@ except ImportError:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Ferramenta de Diagnóstico de Switch v14.7 (Uso de IP + Logs PoE)")
-        self.root.geometry("850x800")
+        self.root.title("Ferramenta de Diagnóstico de Switch v15.0 (Inventário)")
+        self.root.geometry("850x850")  # Aumenta altura para a nova lista
 
         # --- Carregar Dados ---
-        self.all_schools_data = self.load_schools()
-        self.school_map = {school['nome_escola']: school for school in self.all_schools_data}
+        self.school_map = self.load_schools_from_excel()
         self.all_school_names = sorted(list(self.school_map.keys()))
         self.selected_school_name = None
+        self.selected_switch_info = None
 
         # --- Inicializar o Controlador ---
         self.orchestrator = TestOrchestrator(self)
@@ -37,6 +45,7 @@ class App:
         cred_frame = ttk.Frame(control_frame)
         cred_frame.pack(pady=5, padx=5, fill="x")
 
+        # --- Busca de Escola ---
         ttk.Label(cred_frame, text="Buscar Escola:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.school_search_entry = ttk.Entry(cred_frame, width=40)
         self.school_search_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
@@ -51,23 +60,29 @@ class App:
         self.school_listbox.config(yscrollcommand=scrollbar.set)
         self.school_listbox.bind("<<ListboxSelect>>", self._on_school_select)
 
-        # --- Lógica de População Inicial Corrigida ---
-        self._populate_school_listbox(self.all_school_names)
-        if self.all_school_names:
-            self.school_listbox.selection_set(0)
-            # Chama o evento de seleção UMA VEZ no início para preencher o campo
-            self._on_school_select(None)
-            # Define o foco para a lista, para que a seleção inicial seja visível
-            self.school_listbox.focus_set()
+        # --- Nova Lista: Seleção de Switch ---
+        ttk.Label(cred_frame, text="Selecionar Switch:").grid(row=2, column=0, padx=5, pady=5, sticky="nw")
+        switch_list_frame = ttk.Frame(cred_frame)
+        switch_list_frame.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+        self.switch_listbox = tk.Listbox(switch_list_frame, height=3, width=40, exportselection=False)
+        self.switch_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        switch_scrollbar = ttk.Scrollbar(switch_list_frame, orient="vertical", command=self.switch_listbox.yview)
+        switch_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.switch_listbox.config(yscrollcommand=switch_scrollbar.set)
+        self.switch_listbox.bind("<<ListboxSelect>>", self._on_switch_select)
 
-        ttk.Label(cred_frame, text="Usuário (Switch):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        # --- Credenciais ---
+        ttk.Label(cred_frame, text="Usuário (Switch):").grid(row=3, column=0, padx=5, pady=5, sticky="w")
         self.user_entry = ttk.Entry(cred_frame, width=30)
         self.user_entry.insert(0, "admin")
-        self.user_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
-        ttk.Label(cred_frame, text="Senha (Switch):").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        self.user_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+        ttk.Label(cred_frame, text="Senha (Switch):").grid(row=4, column=0, padx=5, pady=5, sticky="w")
         self.pass_entry = ttk.Entry(cred_frame, show="*", width=30)
-        self.pass_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+        self.pass_entry.grid(row=4, column=1, padx=5, pady=5, sticky="w")
         cred_frame.columnconfigure(1, weight=1)
+
+        # Popula a lista de escolas DEPOIS que todos os widgets estiverem prontos
+        self._populate_school_listbox(self.all_school_names)
 
         tests_frame = ttk.LabelFrame(control_frame, text="Testes a Executar")
         tests_frame.pack(fill="x", padx=5, pady=10)
@@ -77,7 +92,6 @@ class App:
             "classify_clients": tk.BooleanVar(value=True),
             "neighbors": tk.BooleanVar(value=True),
             "clients": tk.BooleanVar(value=True),
-            "ip_usage": tk.BooleanVar(value=True), # <--- ADICIONADO
             "health": tk.BooleanVar(value=True),
             "port_errors": tk.BooleanVar(value=True),
             "vlans": tk.BooleanVar(value=True),
@@ -96,29 +110,27 @@ class App:
         col3_frame = ttk.Frame(check_frame);
         col3_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
+        # ... (checkbuttons permanecem os mesmos) ...
         ttk.Checkbutton(col1_frame, text="Ping Switch Operadora (.1)", variable=self.test_vars["ping_operadora"]).pack(
             anchor="w")
         ttk.Checkbutton(col1_frame, text="Classificar Conexão", variable=self.test_vars["classify_clients"]).pack(
             anchor="w")
         ttk.Checkbutton(col1_frame, text="Ping Vizinhos", variable=self.test_vars["neighbors"]).pack(anchor="w")
         ttk.Checkbutton(col1_frame, text="Ping Clientes (Cabo)", variable=self.test_vars["clients"]).pack(anchor="w")
-
-        ttk.Checkbutton(col2_frame, text="Uso de IP (Rede/Máscara)", variable=self.test_vars["ip_usage"]).pack(anchor="w") # <--- ADICIONADO
         ttk.Checkbutton(col2_frame, text="Saúde (CPU/Mem)", variable=self.test_vars["health"]).pack(anchor="w")
         ttk.Checkbutton(col2_frame, text="Erros Portas", variable=self.test_vars["port_errors"]).pack(anchor="w")
         ttk.Checkbutton(col2_frame, text="VLANs", variable=self.test_vars["vlans"]).pack(anchor="w")
         ttk.Checkbutton(col2_frame, text="Status PoE", variable=self.test_vars["poe"]).pack(anchor="w")
-
         ttk.Checkbutton(col3_frame, text="Proteção Loop", variable=self.test_vars["loop_protection"]).pack(anchor="w")
         ttk.Checkbutton(col3_frame, text="Loops Ativos", variable=self.test_vars["active_loops"]).pack(anchor="w")
-        ttk.Checkbutton(col3_frame, text="Logs (DHCP/PoE)", variable=self.test_vars["dhcp_logs"]).pack(anchor="w") # Texto atualizado
+        ttk.Checkbutton(col3_frame, text="Logs DHCP", variable=self.test_vars["dhcp_logs"]).pack(anchor="w")
 
         btn_frame = ttk.Frame(tests_frame)
         btn_frame.pack(fill='x', pady=(5, 0), padx=5)
         ttk.Button(btn_frame, text="Marcar Todos", command=self.select_all_tests).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Desmarcar Todos", command=self.deselect_all_tests).pack(side=tk.LEFT, padx=5)
 
-        self.start_button = ttk.Button(control_frame, text="Iniciar Testes Selecionados",
+        self.start_button = ttk.Button(control_frame, text="Iniciar Testes no Switch Selecionado",
                                        command=self.orchestrator.run_test_in_thread)
         self.start_button.pack(pady=10)
 
@@ -133,58 +145,187 @@ class App:
                                                       font=("Courier New", 9))
         self.results_text.pack(padx=5, pady=5, expand=True, fill="both")
 
+    def _clean_ip(self, raw_ip):
+        """Limpa o IP de prefixos http e barras."""
+        if not isinstance(raw_ip, str):
+            return None
+        # Remove http:// ou https://
+        ip = re.sub(r'https?://', '', raw_ip)
+        # Remove qualquer coisa após a primeira /
+        ip = ip.split('/')[0]
+        # Valida se o que sobrou se parece com um IP
+        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+            return ip
+        return None
+
+    def load_schools_from_excel(self):
+        """
+        Carrega o mapa de escolas e seus switches a partir do arquivo inventario.xlsx.
+        """
+        filename = "inventario.xlsx"
+        school_map = {}
+
+        try:
+            # Tenta encontrar o arquivo no mesmo diretório do script
+            # (Adicione 'import os' no topo do seu App.py)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            filepath = os.path.join(script_dir, filename)
+
+            if not os.path.exists(filepath):
+                # Se não encontrar, tenta no diretório de trabalho atual
+                filepath = filename
+                if not os.path.exists(filepath):
+                    messagebox.showerror("Erro ao Carregar", f"Arquivo '{filename}' não encontrado.")
+                    return {}
+
+            workbook = openpyxl.load_workbook(filepath, data_only=True)
+            ws = workbook.active
+
+        except Exception as e:
+            messagebox.showerror("Erro ao Abrir Excel",
+                                 f"Não foi possível ler o arquivo '{filename}'.\nVerifique se ele não está aberto.\nErro: {e}")
+            return {}
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            school_name = row[0]
+
+            if not school_name:
+                continue
+
+            school_name = str(school_name).strip()
+
+            # --- MUDANÇA 1 ---
+            # Antes: school_map[school_name] = []
+            # Agora: Cria um dicionário com a chave 'switches'
+            if school_name not in school_map:
+                school_map[school_name] = {'switches': []}
+
+            for i in range(4):
+                model_col_idx = 2 + (i * 4)
+                status_col_idx = model_col_idx + 1
+                ip_col_idx = model_col_idx + 2
+
+                if ip_col_idx < len(row):
+                    model = row[model_col_idx]
+                    status = row[status_col_idx]
+                    ip = row[ip_col_idx]
+
+                    model_str = str(model).strip() if model else None
+                    status_str = str(status).strip() if status else None
+                    ip_str = str(ip).strip() if ip else None
+
+                    if model_str or ip_str:
+                        if not model_str and ip_str:
+                            model_str = "Modelo Desconhecido"
+
+                        if ip_str:
+                            ip_cleaned = re.sub(r'https?://', '', ip_str)
+                            ip_cleaned = ip_cleaned.split('/')[0]
+                        else:
+                            ip_cleaned = None
+
+                        # --- MUDANÇA 2 ---
+                        # Antes: school_map[school_name].append({ ... })
+                        # Agora: Adiciona na lista dentro da chave 'switches'
+                        school_map[school_name]['switches'].append({
+                            'id': f"Switch {i + 1}",
+                            'name': model_str,
+                            'status': status_str,
+                            'ip': ip_cleaned
+                        })
+                else:
+                    break
+
+        workbook.close()
+
+        if not school_map:
+            messagebox.showwarning("Aviso", "Nenhuma escola foi carregada do inventário.")
+
+        return school_map
+
     def _populate_school_listbox(self, names):
         self.school_listbox.delete(0, tk.END)
         for name in names:
             self.school_listbox.insert(tk.END, name)
 
     def _on_school_filter_change(self, event):
-        """Filtra a lista sem atualizar o campo de busca."""
+        """Filtra a lista de escolas sem atualizar o campo de busca."""
         search_term = self.school_search_entry.get().lower()
         if not search_term:
             filtered_names = self.all_school_names
         else:
             filtered_names = [name for name in self.all_school_names if search_term in name.lower()]
 
-        # Salva o nome que estava selecionado
         current_selection = self.selected_school_name
-
         self._populate_school_listbox(filtered_names)
 
-        # Tenta re-selecionar o item que estava selecionado
         if current_selection in filtered_names:
             new_index = filtered_names.index(current_selection)
             self.school_listbox.selection_set(new_index)
-        elif filtered_names:  # Se a seleção anterior sumiu, seleciona o primeiro
-            self.school_listbox.selection_set(0)
-            self._on_school_select(None)  # Atualiza a seleção interna
+
+        self.school_search_entry.focus()
 
     def _on_school_select(self, event):
-        """Atualiza a seleção e o campo de busca."""
+        """Atualiza a seleção de escola e popula a lista de switches."""
         selection = self.school_listbox.curselection()
         if selection:
             index = selection[0]
-            self.selected_school_name = self.school_listbox.get(index)
+            new_school_name = self.school_listbox.get(index)
 
-            # Só atualiza o campo de busca se o evento for um clique
-            # ou se for a chamada inicial (event is None)
-            if event is not None or self.school_search_entry.get() == "":
-                current_filter = self.school_search_entry.get()
-                if current_filter != self.selected_school_name:
+            # Atualiza apenas se a seleção mudou
+            if new_school_name != self.selected_school_name:
+                self.selected_school_name = new_school_name
+                self.selected_switch_info = None  # Reseta a seleção de switch
+
+                # Atualiza o campo de busca (apenas se for um clique)
+                if event is not None:
                     self.school_search_entry.delete(0, tk.END)
                     self.school_search_entry.insert(0, self.selected_school_name)
+
+                # Popula a nova lista de switches
+                self.switch_listbox.delete(0, tk.END)
+                switches = self.school_map[self.selected_school_name]['switches']
+                if not switches:
+                    self.switch_listbox.insert(tk.END, "Nenhum switch encontrado para esta escola.")
+                else:
+                    for switch in switches:
+                        self.switch_listbox.insert(tk.END, f"{switch['name']} ({switch['ip']})")
+                    self.switch_listbox.selection_set(0)  # Seleciona o primeiro switch
+                    self._on_switch_select(None)  # Atualiza a seleção interna
+
         else:
-            # Isso pode acontecer se a lista filtrada ficar vazia
             self.selected_school_name = None
+            self.switch_listbox.delete(0, tk.END)
+
+    def _on_switch_select(self, event):
+        """Guarda a informação do switch selecionado."""
+        selection = self.switch_listbox.curselection()
+        if selection:
+            index = selection[0]
+            # Extrai o IP da string (ex: "Omada (10.1.1.1)")
+            selected_string = self.switch_listbox.get(index)
+            ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', selected_string)
+            if ip_match:
+                self.selected_switch_info = {
+                    'ip': ip_match.group(1),
+                    'name': selected_string.split('(')[0].strip()
+                }
+            else:
+                self.selected_switch_info = None
+        else:
+            self.selected_switch_info = None
 
     def load_schools(self):
         try:
-            with open('escolas.csv', 'r', encoding='utf-8') as f:
-                return list(csv.DictReader(f))
+            return self.load_schools_from_excel()
         except FileNotFoundError:
-            messagebox.showerror("Erro Crítico", "Arquivo 'escolas.csv' não encontrado!")
+            messagebox.showerror("Erro Crítico", "Arquivo 'inventario.xlsx' não encontrado!")
             self.root.quit()
-            return []
+            return {}
+        except Exception as e:
+            messagebox.showerror("Erro ao Carregar", f"Falha ao carregar 'inventario.xlsx'.\n{e}")
+            self.root.quit()
+            return {}
 
     def update_results(self, message):
         self.root.after(0, self._update_text, message)
@@ -217,7 +358,7 @@ class App:
         default_filename = "log_diagnostico.txt"
         if self.selected_school_name:
             safe_school_name = re.sub(r'[\\/*?:"<>|]', "", self.selected_school_name)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")  # Esta linha agora usa o módulo 'time'
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
             default_filename = f"log_{safe_school_name}_{timestamp}.txt"
 
         filepath = filedialog.asksaveasfilename(
@@ -236,11 +377,11 @@ class App:
         except Exception as e:
             messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar o arquivo.\nDetalhes: {e}")
 
+    # Define a função helper aqui para estar acessível
     def _skipped_summary(self, test_name):
         return f"⚪ {test_name}: NÃO EXECUTADO (desmarcado pelo usuário)\n\n"
 
-    # --- FUNÇÃO DE RESUMO MODIFICADA (DUPLICADA DO ORCHESTRATOR) ---
-    def generate_and_display_summary(self, data, tests_selected):
+    def generate_and_display_summary(self, data):
         summary = "\n\n==================== RESUMO DO DIAGNÓSTICO ====================\n\n"
 
         skipped_summary = self._skipped_summary
@@ -264,15 +405,13 @@ class App:
                     friendly_names = {
                         'neighbors': 'Teste de Vizinhança',
                         'clients': 'Teste de Clientes',
-                        'ip_usage': 'Verificação de Uso de IP', # <--- ADICIONADO
                         'health_status': 'Saúde do Switch',
                         'port_errors': 'Verificação de Erros nas Portas',
                         'vlan_status': 'Verificação de VLANs',
                         'poe_status': 'Status do PoE',
                         'loopback': 'Proteção Contra Loops',
                         'active_loop': 'Verificação de Loops Ativos',
-                        'dhcp_logs': 'Verificação de Logs DHCP',
-                        'poe_log_errors': 'Verificação de Logs PoE' # <--- ADICIONADO
+                        'dhcp_logs': 'Verificação de Logs DHCP'
                     }
                     skipped_lines.append(skipped_summary(friendly_names.get(test_name, test_name)))
 
@@ -304,20 +443,6 @@ class App:
             op_status = operadora_ping.get('status', 'Falha')
             op_icon = "✅" if op_status == "Sucesso" else "❌"
             executed_lines.append(f"{op_icon} Ping Switch Operadora ({op_ip}): {op_status.upper()}")
-
-        # --- BLOCO NOVO: USO DE IP ---
-        ip_usage_data = data.get('ip_usage', {})
-        if ip_usage_data.get('skipped'):
-            skipped_lines.append(skipped_summary("Verificação de Uso de IP"))
-        elif ip_usage_data.get('total'):
-            used, total, mask = ip_usage_data['used'], ip_usage_data['total'], ip_usage_data['mask']
-            percent = (used / total) * 100 if total > 0 else 0
-            icon = "⚠️" if percent > 85 else "✅" # Alerta se uso for > 85%
-            executed_lines.append(f"{icon} Utilização de IP: {used} de {total} IPs em uso ({percent:.1f}%)")
-            executed_lines.append(f"   - Máscara de Rede: {mask}")
-        else:
-            executed_lines.append(f"⚠️ Utilização de IP: {ip_usage_data.get('used', 0)} IPs contados (Não foi possível obter máscara/total).")
-
 
         health_status = data.get('health_status', {})
         if health_status.get('skipped'):
@@ -423,10 +548,9 @@ class App:
             else:
                 executed_lines.append(f"✅ Verificação de Loops Ativos: Nenhum loop encontrado no momento.")
 
-        # --- BLOCO DE LOGS DHCP (MODIFICADO) ---
         dhcp_logs_data = data.get('dhcp_logs', {})
         if dhcp_logs_data.get('skipped'):
-            skipped_lines.append(skipped_summary("Verificação de Logs (DHCP/PoE)"))
+            skipped_lines.append(skipped_summary("Verificação de Logs DHCP"))
         else:
             log_status_msg = dhcp_logs_data.get('status', 'Não verificado')
             log_lines = dhcp_logs_data.get('lines', [])
@@ -437,23 +561,6 @@ class App:
                 executed_lines.append(f"✅ Verificação de Logs DHCP: Nenhum erro encontrado nos logs recentes.")
             else:
                 executed_lines.append(f"⚠️ Verificação de Logs DHCP: {log_status_msg}.")
-
-        # --- BLOCO NOVO: LOGS POE ---
-        poe_logs_data = data.get('poe_log_errors', {})
-        if poe_logs_data.get('skipped'):
-            # Já tratado pelo skip do DHCP
-            pass
-        else:
-            poe_log_status_msg = poe_logs_data.get('status', 'Não verificado')
-            poe_log_lines = poe_logs_data.get('lines', [])
-            if "ERROS PoE ENCONTRADOS" in poe_log_status_msg:
-                executed_lines.append(f"❌ Verificação de Logs PoE: ERROS ENCONTRADOS!")
-                executed_lines.append(f"   - Exemplo: {poe_log_lines[0] if poe_log_lines else 'N/A'}")
-            elif "Nenhum erro" in poe_log_status_msg:
-                executed_lines.append(f"✅ Verificação de Logs PoE: Nenhum erro encontrado nos logs recentes.")
-            else:
-                executed_lines.append(f"⚠️ Verificação de Logs PoE: {poe_log_status_msg}.")
-
 
         # --- Agora, constrói a string final do sumário ---
         if executed_lines:
@@ -466,6 +573,34 @@ class App:
 
         summary += "\n===============================================================\n"
         self.update_results(summary)
+
+    def save_log_to_file(self):
+        log_content = self.results_text.get("1.0", tk.END)
+        if not log_content.strip():
+            messagebox.showwarning("Aviso", "Não há resultados para salvar.")
+            return
+
+        default_filename = "log_diagnostico.txt"
+        if self.selected_school_name:
+            safe_school_name = re.sub(r'[\\/*?:"<>|]', "", self.selected_school_name)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")  # Esta linha agora usa o módulo 'time'
+            default_filename = f"log_{safe_school_name}_{timestamp}.txt"
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Arquivos de Texto", "*.txt"), ("Todos os Arquivos", "*.*")],
+            initialfile=default_filename,
+            title="Salvar Log Como..."
+        )
+
+        if not filepath: return
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(log_content)
+            messagebox.showinfo("Sucesso", f"Log salvo com sucesso em:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar o arquivo.\nDetalhes: {e}")
 
 
 if __name__ == "__main__":
