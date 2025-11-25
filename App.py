@@ -384,49 +384,72 @@ class App:
     def generate_and_display_summary(self, data):
         summary = "\n\n==================== RESUMO DO DIAGNÓSTICO ====================\n\n"
 
+        # Helper para testes pulados MANUALMENTE (desmarcados)
         skipped_summary = self._skipped_summary
 
         executed_lines = []
         skipped_lines = []
 
+        # --- CENÁRIO 1: FALHA DE CONEXÃO COM O SWITCH ---
         if not data.get('connection'):
-            summary += f"❌ Conexão com o Switch da Escola: FALHA\n\n"
+            summary += f"❌ Conexão com o Switch da Escola: FALHA\n"
+            summary += f"   (Os testes internos do switch não puderam ser realizados)\n\n"
+
+            # 1. Tenta exibir o Ping de Contingência (Local)
             operadora_ping = data.get('operadora_ping', {})
-            if not operadora_ping.get('skipped', True) and operadora_ping.get('local'):
+
+            # Se tiver a flag 'local' e status definido, mostramos como EXECUTADO
+            if operadora_ping.get('local') and operadora_ping.get('status'):
                 op_ip = operadora_ping.get('ip', 'N/A')
                 op_status = operadora_ping.get('status', 'Falha')
-                op_icon = "✅" if op_status == "Sucesso" else "❌"
-                executed_lines.append(f"{op_icon} Ping LOCAL para Switch Operadora ({op_ip}): {op_status.upper()}")
+                # Ícone: Check se Sucesso, X se Falha
+                op_icon = "✅" if "Sucesso" in op_status else "❌"
+
+                executed_lines.append(f"--- TESTE DE CONTINGÊNCIA (VIA PC LOCAL) ---")
+                executed_lines.append(f"{op_icon} Ping Switch Vizinho/Gateway ({op_ip}): {op_status.upper()}")
+
             elif not operadora_ping.get('skipped'):
-                skipped_lines.append(skipped_summary("Ping Switch Operadora (.1)"))
+                # Se não foi local e nem pulado, caiu aqui por erro estranho
+                skipped_lines.append("⚪ Ping Switch Operadora: ERRO DESCONHECIDO\n")
 
-            for test_name, data_dict in data.items():
-                if data_dict == {'skipped': True} and test_name != 'operadora_ping':
-                    friendly_names = {
-                        'neighbors': 'Teste de Vizinhança',
-                        'clients': 'Teste de Clientes',
-                        'health_status': 'Saúde do Switch',
-                        'port_errors': 'Verificação de Erros nas Portas',
-                        'vlan_status': 'Verificação de VLANs',
-                        'poe_status': 'Status do PoE',
-                        'loopback': 'Proteção Contra Loops',
-                        'active_loop': 'Verificação de Loops Ativos',
-                        'dhcp_logs': 'Verificação de Logs DHCP'
-                    }
-                    skipped_lines.append(skipped_summary(friendly_names.get(test_name, test_name)))
+            # 2. Lista os outros testes como CANCELADOS (e não desmarcados)
+            # Dicionário mapeando as chaves do 'test_vars' para nomes bonitos
+            friendly_names = {
+                'ping_operadora': 'Ping Switch Operadora',  # Caso apareça aqui
+                'classify_clients': 'Classificação de Clientes',
+                'neighbors': 'Teste de Vizinhança',
+                'clients': 'Teste de Clientes',
+                'health': 'Saúde do Switch (CPU/Mem)',
+                'port_errors': 'Erros nas Portas',
+                'vlans': 'Verificação de VLANs',
+                'loop_protection': 'Proteção de Loop',
+                'active_loops': 'Loops Ativos',
+                'poe': 'Status PoE',
+                'dhcp_logs': 'Logs DHCP'
+            }
 
+            for test_key, test_data in data.items():
+                # Ignora chaves de controle e o ping que já tratamos acima
+                if test_key in ['connection', 'model', 'operadora_ping']:
+                    continue
+
+                # Pega o nome bonito ou usa a chave se não achar
+                name = friendly_names.get(test_key, test_key)
+                skipped_lines.append(f"⚪ {name}: CANCELADO (Falha de conexão SSH/Telnet)\n")
+
+            # Monta o texto final deste cenário
             if executed_lines:
-                summary += "--- TESTES EXECUTADOS ---\n\n"
-                summary += "\n\n".join(executed_lines)
+                summary += "\n".join(executed_lines) + "\n\n"
 
             if skipped_lines:
-                summary += "\n\n--- TESTES NÃO EXECUTADOS ---\n\n"
+                summary += "--- TESTES CANCELADOS ---\n\n"
                 summary += "".join(skipped_lines)
 
             summary += "\n===============================================================\n"
             self.update_results(summary)
             return
 
+        # --- CENÁRIO 2: CONEXÃO COM SUCESSO (CÓDIGO ORIGINAL MANTIDO/AJUSTADO) ---
         summary += f"✅ Conexão com o Switch da Escola: SUCESSO\n"
         summary += f"   - Modelo do Switch Identificado: {data.get('model', 'N/A').upper()}\n\n"
 
@@ -435,15 +458,18 @@ class App:
             self.update_results(summary)
             return
 
+        # Ping Operadora (Via Switch)
         operadora_ping = data.get('operadora_ping', {})
         if operadora_ping.get('skipped'):
             skipped_lines.append(skipped_summary("Ping Switch Operadora (.1)"))
         else:
             op_ip = operadora_ping.get('ip', 'N/A')
             op_status = operadora_ping.get('status', 'Falha')
+            local_tag = " (VIA PC)" if operadora_ping.get('local') else ""
             op_icon = "✅" if op_status == "Sucesso" else "❌"
-            executed_lines.append(f"{op_icon} Ping Switch Operadora ({op_ip}): {op_status.upper()}")
+            executed_lines.append(f"{op_icon} Ping Switch Operadora ({op_ip}){local_tag}: {op_status.upper()}")
 
+        # Saúde
         health_status = data.get('health_status', {})
         if health_status.get('skipped'):
             skipped_lines.append(skipped_summary("Saúde do Switch"))
@@ -456,6 +482,7 @@ class App:
         else:
             executed_lines.append(f"⚠️ Saúde do Switch: Não foi possível verificar.")
 
+        # PoE
         poe_status = data.get('poe_status', {})
         if poe_status.get('skipped'):
             skipped_lines.append(skipped_summary("Status do PoE"))
@@ -469,8 +496,11 @@ class App:
             else:
                 executed_lines.append(f"✅ Consumo de Energia (PoE): {consumption:.2f}W utilizados.")
         else:
-            executed_lines.append(f"⚠️ Consumo de Energia (PoE): Não foi possível verificar.")
+            # Se o dicionário estiver vazio mas não skipped, é pq o switch não tem PoE ou falhou o comando
+            if not poe_status.get('skipped'):
+                executed_lines.append(f"ℹ️ Status do PoE: Sem dados ou não suportado.")
 
+        # Erros Portas
         port_errors_data = data.get('port_errors', {})
         if port_errors_data.get('skipped'):
             skipped_lines.append(skipped_summary("Verificação de Erros nas Portas"))
@@ -485,6 +515,7 @@ class App:
             else:
                 executed_lines.append(f"⚠️ Verificação de Erros nas Portas: {port_error_status}.")
 
+        # VLANs
         vlan_data = data.get('vlan_status', {})
         if vlan_data.get('skipped'):
             skipped_lines.append(skipped_summary("Verificação de VLANs"))
@@ -498,6 +529,7 @@ class App:
             else:
                 executed_lines.append(f"⚠️ Verificação de VLANs: {vlan_status_msg}.")
 
+        # Vizinhos
         neighbors_data = data.get('neighbors', {})
         if neighbors_data.get('skipped'):
             skipped_lines.append(skipped_summary("Teste de Vizinhança"))
@@ -511,6 +543,7 @@ class App:
             for ip, status in neighbors_data['results'].items():
                 executed_lines.append(f"   - IP: {ip} -> {status}")
 
+        # Clientes
         clients_data = data.get('clients', {})
         if clients_data.get('skipped'):
             skipped_lines.append(skipped_summary("Teste de Clientes"))
@@ -528,14 +561,17 @@ class App:
                 result = clients_data['results'].get(ip, {}).get('status', 'N/A')
                 executed_lines.append(f"   - IP: {ip} ({conn_type}) -> {result}")
 
+        # Loopback
         loopback_status = data.get('loopback')
         if isinstance(loopback_status, dict) and loopback_status.get('skipped'):
             skipped_lines.append(skipped_summary("Proteção Contra Loops"))
         elif loopback_status == 'Ativado':
             executed_lines.append(f"✅ Proteção Contra Loops (Funcionalidade): ATIVADO")
         else:
+            # Se o valor for string (Ativado/Desativado)
             executed_lines.append(f"⚠️ Proteção Contra Loops (Funcionalidade): {str(loopback_status).upper()}")
 
+        # Loops Ativos
         active_loop_data = data.get('active_loop', {})
         if active_loop_data.get('skipped'):
             skipped_lines.append(skipped_summary("Verificação de Loops Ativos"))
@@ -548,6 +584,7 @@ class App:
             else:
                 executed_lines.append(f"✅ Verificação de Loops Ativos: Nenhum loop encontrado no momento.")
 
+        # Logs DHCP
         dhcp_logs_data = data.get('dhcp_logs', {})
         if dhcp_logs_data.get('skipped'):
             skipped_lines.append(skipped_summary("Verificação de Logs DHCP"))
@@ -562,14 +599,14 @@ class App:
             else:
                 executed_lines.append(f"⚠️ Verificação de Logs DHCP: {log_status_msg}.")
 
-        # --- Agora, constrói a string final do sumário ---
+        # --- Monta o relatório final ---
         if executed_lines:
             summary += "--- TESTES EXECUTADOS ---\n\n"
-            summary += "\n\n".join(executed_lines)  # Adiciona espaço entre cada bloco de teste
+            summary += "\n\n".join(executed_lines)
 
         if skipped_lines:
             summary += "\n\n--- TESTES NÃO EXECUTADOS ---\n\n"
-            summary += "".join(skipped_lines)  # skipped_summary já inclui \n\n
+            summary += "".join(skipped_lines)
 
         summary += "\n===============================================================\n"
         self.update_results(summary)
